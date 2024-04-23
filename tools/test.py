@@ -5,15 +5,74 @@ import os.path as osp
 import warnings
 from copy import deepcopy
 
-from mmengine import ConfigDict
-from mmengine.config import Config, DictAction
-from mmengine.runner import Runner
-
+import racon.torch as racon_torch
+import recogni.torch as rtorch
+import torch
 from mmdet.engine.hooks.utils import trigger_visualization_hook
 from mmdet.evaluation import DumpDetResults
 from mmdet.registry import RUNNERS
+from mmdet.structures import DetDataSample
 from mmdet.utils import setup_cache_size_limit_of_dynamo
+from mmengine import ConfigDict
+from mmengine.config import Config, DictAction
+from mmengine.hooks import Hook
+from mmengine.registry import HOOKS
+from mmengine.runner import Runner
+from recogni.torch.conversion.prepare import PrepareStrategy
+from recogni.torch.conversion.prepare.mapping import DEFAULT_MAPPING_INCL_CLS, Fn2FactoryMapping
 
+
+@HOOKS.register_module()
+class ConvertModelHook(Hook):
+    """Hook to convert model to recogni-compatible format."""
+
+    def before_test(self, runner) -> None:
+        """All subclasses should override this method, if they need any operations before testing."""
+        runner.model = self._convert_model(runner.model.eval())
+        print(runner.model)
+
+    def _get_data_sample(self, img_shape, pad_shape):
+        """Return an object of DetDataSample type."""
+        data_sample = DetDataSample()
+        img_meta = dict(img_shape=img_shape, pad_shape=pad_shape)
+        data_sample.set_metainfo(img_meta)
+        # t_instances = InstanceData(metainfo=img_meta)
+        # gt_instances.bboxes = torch.rand((5, 4))
+        # gt_instances.labels = torch.rand((5,))
+        # data_sample.gt_instances = gt_instances
+        # print(data_sample)
+        # print(data_sample.gt_instances.metainfo_keys())
+        return data_sample
+
+    def _prepare_model(self, model, data_sample):
+        """Model preparation step."""
+        sample_kwargs = {
+            "inputs": torch.randn((1, 3, 1088, 1632), dtype=torch.float32, device="cuda:0"),
+            "data_samples": [
+                data_sample,
+            ],
+        }
+
+        prepared_model = rtorch.conversion.prepare(
+            module=model.eval(),
+            concrete_args=(sample_kwargs,),
+            mapping=Fn2FactoryMapping(DEFAULT_MAPPING_INCL_CLS),
+            strategy=PrepareStrategy.TRACE_DYNAMO,
+        )
+        return prepared_model
+
+    def _convert_model(self, model):
+        """Convert the model."""
+        # transform the model
+        data_sample = self._get_data_sample(img_shape=(1088, 1632), pad_shape=(1088, 1632))
+        prepared_model = self._prepare_model(model, data_sample)
+
+        model_api = racon_torch.api.Model(
+            ops=racon_torch.api.Op(add=racon_torch.api.ops.AddV2()),
+            batchnorm_folding=racon_torch.api.Batchnorm(enabled=True),
+        )
+        transformed_model, _ = racon_torch.utils.transform_model(prepared_model, model_api)
+        return transformed_model
 
 # TODO: support fuse_conv_bn and format_only
 def parse_args():
@@ -142,6 +201,7 @@ def main():
             DumpDetResults(out_file_path=args.out))
 
     # start testing
+    runner.register_custom_hooks([dict(type="ConvertModelHook")])
     runner.test()
 
 
